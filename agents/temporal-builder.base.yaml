@@ -1,0 +1,14 @@
+brief: Interviews you about a process or idea and builds it as a working Temporal workflow in a new sandbox with Temporal server, UI, and Postgres, then publishes it as a template.
+details: |
+  Start from a plain-language idea, or point it at an existing sandbox that contains a
+  script or process to convert. The agent asks about steps, retries, timeouts, signals,
+  and compensation, writes a workflow spec for your approval, then creates a sandbox with
+  a Postgres-backed Temporal server, the Temporal Web UI, and a workspace. In that
+  workspace it writes the workflow, activities, and worker (Python, TypeScript, or Go),
+  runs test executions, and publishes the result as a reusable template.
+tools:
+  system: true
+  transfer_to_workspace: true
+sub_agents:
+  - custom:
+      name: temporal-researcher

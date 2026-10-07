@@ -1,0 +1,285 @@
+# Temporal stack for Crafting sandboxes.
+#
+# - postgres:        persistence for Temporal (data survives suspend/resume)
+# - temporal-admin:  creates/upgrades the Temporal schema, then registers the
+#                    default namespace once the server is healthy
+# - temporal:        Temporal server (gRPC on temporal:7233, in-sandbox only)
+# - temporal-ui:     Temporal Web UI, exposed via the "temporal-ui" endpoint
+# - dev:             workspace with the temporal CLI, the Temporal developer
+#                    skill, and a repo-less "workflow" checkout whose worker
+#                    daemon runs as the workspace owner
+env:
+  - TEMPORAL_ADDRESS=temporal:7233
+  - TEMPORAL_NAMESPACE=default
+  - TEMPORAL_TASK_QUEUE=main
+
+endpoints:
+  - name: temporal-ui
+    http:
+      routes:
+        - path_prefix: /
+          backend:
+            target: temporal-ui
+            port: http
+
+volumes:
+  - name: pgdata
+  - name: temporal-dyncfg
+    content:
+      text: |
+        limit.maxIDLength:
+          - value: 255
+            constraints: {}
+        system.forceSearchAttributesCacheRefreshOnRead:
+          - value: true
+            constraints: {}
+
+containers:
+  - name: postgres
+    image: postgres:16
+    env:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    ports:
+      - name: pg
+        port: 5432
+        protocol: TCP
+    volume_mounts:
+      - name: pgdata
+        path: /var/lib/postgresql/data
+    probes:
+      readiness:
+        - name: pg-ready
+          tcp_port: 5432
+
+  # Container args are env-expanded by Crafting before the shell runs them:
+  # shell-local variables must be written as $$NAME.
+  - name: temporal-admin
+    image: temporalio/admin-tools:1.31.0
+    wait_for:
+      - postgres
+    env:
+      - POSTGRES_SEEDS=postgres
+      - SQL_PASSWORD=temporal
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+    entrypoint:
+      - sh
+      - -c
+    args:
+      - |
+        set -u
+        rm -f /tmp/schema-ready
+        until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done
+        SQL="temporal-sql-tool --plugin postgres12 --ep postgres -p 5432 -u temporal --pw temporal"
+        SCHEMA=/etc/temporal/schema/postgresql/v12
+        for db in temporal temporal_visibility; do
+          $$SQL --db "$$db" create 2>/dev/null || true
+          $$SQL --db "$$db" setup-schema -v 0.0 2>/dev/null || true
+        done
+        $$SQL --db temporal update-schema -d "$$SCHEMA/temporal/versioned" || exit 1
+        $$SQL --db temporal_visibility update-schema -d "$$SCHEMA/visibility/versioned" || exit 1
+        touch /tmp/schema-ready
+        echo "schema ready"
+        until temporal operator cluster health --address "$TEMPORAL_ADDRESS" >/dev/null 2>&1; do
+          echo "waiting for temporal server"; sleep 3
+        done
+        temporal operator namespace describe -n "$TEMPORAL_NAMESPACE" --address "$TEMPORAL_ADDRESS" >/dev/null 2>&1 \
+          || temporal operator namespace create -n "$TEMPORAL_NAMESPACE" --retention 72h --address "$TEMPORAL_ADDRESS"
+        echo "namespace $TEMPORAL_NAMESPACE ready"
+        trap exit INT HUP TERM
+        sleep infinity &
+        wait
+    probes:
+      readiness:
+        - name: schema-ready
+          command: test -f /tmp/schema-ready
+
+  - name: temporal
+    image: temporalio/server:1.31.0
+    wait_for:
+      - temporal-admin
+    # wait_for only applies at creation; also wait for postgres on resume.
+    entrypoint:
+      - sh
+      - -c
+    args:
+      - |
+        until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done
+        exec /etc/temporal/entrypoint.sh
+    env:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_SEEDS=postgres
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - BIND_ON_IP=0.0.0.0
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/dynamicconfig.yaml
+    volume_mounts:
+      - name: temporal-dyncfg
+        path: /etc/temporal/dynamicconfig.yaml
+    ports:
+      - name: grpc
+        port: 7233
+        protocol: GRPC/TCP
+    probes:
+      readiness:
+        - name: grpc-ready
+          tcp_port: 7233
+
+  - name: temporal-ui
+    image: temporalio/ui:2.49.1
+    wait_for:
+      - temporal
+    env:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - name: http
+        port: 8080
+        protocol: HTTP/TCP
+
+workspaces:
+  - name: dev
+    wait_for:
+      - temporal
+    env:
+      - PATH=$HOME/.local/bin:$PATH
+    checkouts:
+      - path: workflow
+        manifest:
+          overlays:
+            - inline:
+                hooks:
+                  build:
+                    cmd: |
+                      if [ -x bin/setup ]; then bin/setup; else echo "no bin/setup yet"; fi
+                daemons:
+                  worker:
+                    run:
+                      cmd: bin/worker.sh
+                commands:
+                  start-workflow:
+                    run:
+                      cmd: bin/start-workflow
+    system:
+      files:
+        - path: ~/workflow/bin/worker.sh
+          mode: "0755"
+          content: |
+            #!/bin/bash
+            # Runs the worker once bin/start-worker exists.
+            cd "$(dirname "$0")/.."
+            until [ -x bin/start-worker ]; do
+              echo "waiting for bin/start-worker"
+              sleep 10
+            done
+            exec bin/start-worker
+        - path: ~/workflow/README.md
+          content: |
+            # Temporal workflow
+
+            - `bin/setup` installs dependencies (run by the checkout build hook).
+            - `bin/start-worker` runs the worker (started by the `worker` daemon).
+            - `bin/start-workflow` starts a workflow execution.
+
+            Temporal server: `$TEMPORAL_ADDRESS`, namespace `$TEMPORAL_NAMESPACE`,
+            task queue `$TEMPORAL_TASK_QUEUE`.
+
+            Publish this sandbox, including the code under `~/workflow`, as a
+            template: `temporal-export-template TEMPLATE_NAME`.
+        - path: ~/.local/bin/temporal-export-template
+          mode: "0755"
+          content: |
+            #!/usr/bin/env python3
+            """Publish this sandbox as a template, with ~/workflow inlined as setup files.
+
+            Usage: temporal-export-template NAME [--description TEXT] [--dry-run]
+            """
+            import argparse, os, subprocess, sys, tempfile
+
+            try:
+                import yaml
+            except ImportError:
+                os.execvp("uv", ["uv", "run", "--quiet", "--with", "pyyaml", "python3", *sys.argv])
+
+            SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".git", ".pytest_cache",
+                         ".mypy_cache", ".ruff_cache", "dist", "build", "target", ".temporal"}
+            MAX_TOTAL = 512 * 1024
+
+            def literal(dumper, s):
+                style = "|" if "\n" in s else None
+                return dumper.represent_scalar("tag:yaml.org,2002:str", s, style=style)
+
+            yaml.SafeDumper.add_representer(str, literal)
+
+            ap = argparse.ArgumentParser()
+            ap.add_argument("name")
+            ap.add_argument("--description", default="")
+            ap.add_argument("--root", default="~/workflow")
+            ap.add_argument("--dry-run", action="store_true")
+            args = ap.parse_args()
+
+            home = os.path.expanduser("~")
+            root = os.path.expanduser(args.root)
+            sandbox = os.environ.get("SANDBOX_FULL_NAME") or os.environ["SANDBOX_NAME"]
+            workspace = os.environ["SANDBOX_WORKLOAD"]
+
+            out = subprocess.check_output(["cs", "sandbox", "show", sandbox, "--def"], text=True)
+            definition = yaml.safe_load(out)
+            ws = next(w for w in definition.get("workspaces", []) if w["name"] == workspace)
+            files = ws.setdefault("system", {}).setdefault("files", [])
+            by_path = {f["path"]: f for f in files}
+
+            total = 0
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+                for fn in sorted(filenames):
+                    full = os.path.join(dirpath, fn)
+                    if os.path.islink(full) or fn.endswith((".pyc", ".log")):
+                        continue
+                    data = open(full, "rb").read()
+                    try:
+                        text = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        print(f"skipping binary file {full}", file=sys.stderr)
+                        continue
+                    total += len(data)
+                    path = "~/" + os.path.relpath(full, home)
+                    entry = {"path": path, "content": text}
+                    if os.access(full, os.X_OK):
+                        entry["mode"] = "0755"
+                    by_path[path] = entry
+            if total > MAX_TOTAL:
+                sys.exit(f"{root} has {total} bytes of source; too large to inline. Use a git checkout instead.")
+            ws["system"]["files"] = list(by_path.values())
+
+            rendered = yaml.safe_dump(definition, sort_keys=False, allow_unicode=True, width=1000)
+            if args.dry_run:
+                print(rendered)
+                sys.exit(0)
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                f.write(rendered)
+            exists = subprocess.run(["cs", "template", "show", args.name],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            cmd = ["cs", "template", "update" if exists else "create", args.name, f.name]
+            if args.description and not exists:
+                cmd += ["--description", args.description]
+            subprocess.check_call(cmd)
+            print(f"{'updated' if exists else 'created'} template {args.name} ({len(by_path)} files, {total} bytes of source)")
+    lifecycle:
+      on_create:
+        max_retries: 3
+        run:
+          cmd: |
+            set -e
+            mkdir -p ~/.local/bin
+            if ! command -v temporal >/dev/null 2>&1; then
+              curl -sSfL "https://temporal.download/cli/archive/latest?platform=linux&arch=amd64" \
+                | tar -xz -C ~/.local/bin temporal
+            fi
+            if [ ! -d ~/.agents/skills/temporal-developer ]; then
+              mkdir -p ~/.agents/skills
+              git clone --depth 1 https://github.com/temporalio/skill-temporal-developer \
+                ~/.agents/skills/temporal-developer
+            fi
