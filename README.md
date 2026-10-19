@@ -11,6 +11,10 @@ and publishes the result as a reusable template.
 | `temporal-builder` | Runs the interview, writes the workflow spec, creates the sandbox, builds and verifies the code, and publishes the template. |
 | `temporal-researcher` | Sub-agent. Inspects an existing sandbox read-only and reports how its process works. |
 
+## Demo video
+
+[![Demo video: building an order fulfillment workflow with the Temporal Workflow Builder](docs/demo-thumbnail.png)](https://cdn.jsdelivr.net/gh/crafting-demo/temporal-builder-agent@main/docs/demo.mp4)
+
 ## What you get
 
 Every generated sandbox includes:
